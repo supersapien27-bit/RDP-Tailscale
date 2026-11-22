@@ -15,31 +15,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Install and Connect Tailscale
-        shell: powershell
-        run: |
-          $ProgressPreference = 'SilentlyContinue'
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "$env:TEMP\tailscale-setup.exe"
-          Start-Process "$env:TEMP\tailscale-setup.exe" -ArgumentList "/quiet", "/norestart" -Wait
-          $env:Path += ";C:\Program Files\Tailscale"
-          Start-Sleep -Seconds 3
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="${{ inputs.user_prefix }}-${{ github.run_id }}" --accept-routes
-
-      - name: Enable RDP
-        shell: powershell
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
-
-      - name: Set RDP Credentials
-        shell: powershell
-        run: |
-          $Password = ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force
-          $UserAccount = Get-LocalUser -Name "runneradmin"
-          $UserAccount | Set-LocalUser -Password $Password
-
-      - name: Install Software and Playwright
+      - name: Install Software, Python 3.14.5, and Playwright
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -55,25 +31,47 @@ jobs:
           Start-Process "$env:TEMP\winrar_installer.exe" -ArgumentList "/s" -Wait
           Remove-Item "$env:TEMP\winrar_installer.exe" -Force -ErrorAction SilentlyContinue
 
-          # 3. Silently install Python 3.14.5 with system PATH integration
+          # 3. Silently install Python 3.14.5 to a deterministic path
           $PythonVersion = "3.14.5"
-          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe" -OutFile "$env:TEMP\python_installer.exe"
+          $PythonDir = "C:\Python314"
+          $PythonExe = Join-Path $PythonDir "python.exe"
+          $PythonScripts = Join-Path $PythonDir "Scripts"
+          $PythonInstaller = "$env:TEMP\python_installer.exe"
+
+          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe" -OutFile $PythonInstaller
           $PythonArgs = @(
               '/quiet',
               'InstallAllUsers=1',
+              "TargetDir=$PythonDir",
               'PrependPath=1',
               'Include_test=0'
           )
-          Start-Process -FilePath "$env:TEMP\python_installer.exe" -ArgumentList $PythonArgs -Wait
-          Remove-Item "$env:TEMP\python_installer.exe" -Force -ErrorAction SilentlyContinue
+          $PyProc = Start-Process -FilePath $PythonInstaller -ArgumentList $PythonArgs -Wait -PassThru
+          Remove-Item $PythonInstaller -Force -ErrorAction SilentlyContinue
 
-          # Refresh environment PATH for current session
-          $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+          if ($PyProc.ExitCode -ne 0 -or -not (Test-Path $PythonExe)) {
+              throw "Python $PythonVersion installation failed (exit code $($PyProc.ExitCode))."
+          }
 
-          # 4. Install Playwright and its Chromium binaries
-          python -m pip install --upgrade pip
-          python -m pip install playwright
-          python -m playwright install chromium
+          # Force Python 3.14.5 ahead of runner's pre-installed Python 3.12 in Machine PATH (applies to RDP sessions too)
+          $MachinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+          $CleanedMachinePath = ($MachinePath -split ';' | Where-Object {
+              $_ -and ($_ -ne $PythonDir) -and ($_ -ne $PythonScripts)
+          }) -join ';'
+          $NewMachinePath = "$PythonDir;$PythonScripts;$CleanedMachinePath"
+          [System.Environment]::SetEnvironmentVariable("Path", $NewMachinePath, "Machine")
+
+          # Refresh current session PATH with Python 3.14.5 first
+          $UserPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+          $env:Path = "$NewMachinePath;$UserPath"
+
+          Write-Host "Active Python binary: $((Get-Command python).Source)"
+          & $PythonExe --version
+
+          # 4. Install Playwright and its Chromium binaries specifically into Python 3.14.5
+          & $PythonExe -m pip install --upgrade pip
+          & $PythonExe -m pip install playwright
+          & $PythonExe -m playwright install chromium
 
       - name: Install Latest AliasMode
         shell: powershell
@@ -129,19 +127,43 @@ jobs:
               exit 0
           }
 
-          Write-Host "Pre-downloading AliasMode Chromium engine..."
+          Write-Host "Pre-downloading default AliasMode Chromium engine..."
           Push-Location $AliasModeDir
           try {
-              & $Sidecar install-browser --engine chromium
+              & $Sidecar install-browser
               if ($LASTEXITCODE -ne 0) {
-                  Write-Warning "Sidecar install-browser returned exit code $LASTEXITCODE. Printing help for diagnostics:"
-                  & $Sidecar --help
+                  Write-Warning "Sidecar install-browser returned exit code $LASTEXITCODE."
                   exit $LASTEXITCODE
               }
               Write-Host "AliasMode Chromium engine pre-downloaded successfully."
           } finally {
               Pop-Location
           }
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+
+      - name: Set RDP Credentials
+        shell: powershell
+        run: |
+          $Password = ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force
+          $UserAccount = Get-LocalUser -Name "runneradmin"
+          $UserAccount | Set-LocalUser -Password $Password
+
+      - name: Install and Connect Tailscale
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "$env:TEMP\tailscale-setup.exe"
+          Start-Process "$env:TEMP\tailscale-setup.exe" -ArgumentList "/quiet", "/norestart" -Wait
+          Remove-Item "$env:TEMP\tailscale-setup.exe" -Force -ErrorAction SilentlyContinue
+          $env:Path += ";C:\Program Files\Tailscale"
+          Start-Sleep -Seconds 3
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="${{ inputs.user_prefix }}-${{ github.run_id }}" --accept-routes
 
       - name: Keep Alive
         shell: powershell
