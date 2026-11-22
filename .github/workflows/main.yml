@@ -65,18 +65,22 @@ jobs:
               "Authorization" = "Bearer ${{ secrets.GITHUB_TOKEN }}"
           }
           $Releases = Invoke-RestMethod -Uri "https://api.github.com/repos/aliasmode/aliasmode/releases?per_page=10" -Headers $Headers
-          $Asset = $Releases |
-              Where-Object { -not $_.draft } |
-              ForEach-Object { $_.assets } |
-              Where-Object { $_.name -like "*_x64-offline-setup.exe" } |
+          $Release = $Releases |
+              Where-Object { -not $_.draft -and ($_.assets | Where-Object { $_.name -like "*_x64-offline-setup.exe" }) } |
               Select-Object -First 1
 
-          if (-not $Asset) {
+          if (-not $Release) {
               throw "Could not locate an x64 offline setup asset in recent aliasmode/aliasmode releases."
           }
 
+          $Asset = $Release.assets |
+              Where-Object { $_.name -like "*_x64-offline-setup.exe" } |
+              Select-Object -First 1
+
+          Add-Content -Path $env:GITHUB_ENV -Value "ALIASMODE_TAG=$($Release.tag_name)" -Encoding ascii
+
           $InstallerPath = Join-Path $TargetDir $Asset.name
-          Write-Host "Downloading $($Asset.name)..."
+          Write-Host "Downloading $($Asset.name) ($($Release.tag_name))..."
           Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $InstallerPath
 
           Write-Host "Running silent NSIS installation..."
@@ -96,26 +100,69 @@ jobs:
         shell: powershell
         continue-on-error: true
         run: |
+          $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
-          $AliasModeDir = Join-Path $env:LOCALAPPDATA "AliasMode"
-          $Sidecar = Join-Path $AliasModeDir "aliasmode-sidecar.exe"
 
-          if (-not (Test-Path $Sidecar)) {
-              Write-Warning "aliasmode-sidecar.exe not found at $Sidecar. Skipping engine pre-download."
-              exit 0
-          }
+          $Tag = if ($env:ALIASMODE_TAG) { $env:ALIASMODE_TAG } else { "main" }
+          $SpecUrl = "https://raw.githubusercontent.com/aliasmode/aliasmode/$Tag/aliasmode-chromium.ts"
+          Write-Host "Reading pinned Windows Chromium spec from $Tag..."
+          $ChromiumSrc = Invoke-RestMethod -Uri $SpecUrl
 
-          Write-Host "Pre-downloading default AliasMode Chromium engine..."
-          Push-Location $AliasModeDir
+          $OwnVersion = if ($ChromiumSrc -match 'const\s+OWN_VERSION\s*=\s*"([^"]+)"') { $Matches[1] } else { throw "Could not parse OWN_VERSION" }
+          $OwnRelease = if ($ChromiumSrc -match 'const\s+OWN_RELEASE\s*=\s*"([^"]+)"') { $Matches[1] } else { throw "Could not parse OWN_RELEASE" }
+          $WinBlock   = if ($ChromiumSrc -match '(?s)const\s+WINDOWS_BUILD\s*=\s*\{(.*?)\r?\n\};') { $Matches[1] } else { throw "Could not parse WINDOWS_BUILD" }
+
+          $ExecutableRel = if ($WinBlock -match 'executable:\s*"([^"]+)"') { $Matches[1] } else { throw "Could not parse executable" }
+          $ArchiveSha256 = if ($WinBlock -match 'archiveSha256:\s*"([a-fA-F0-9]{64})"') { $Matches[1].ToLowerInvariant() } else { throw "Could not parse archiveSha256" }
+          $ExeSha256     = if ($WinBlock -match 'executableSha256:\s*"([a-fA-F0-9]{64})"') { $Matches[1].ToLowerInvariant() } else { throw "Could not parse executableSha256" }
+
+          $ArchiveRoot    = "aliasmode-chromium-$OwnVersion-windows-x64"
+          $RuntimeDirName = "chromium-$OwnVersion-$OwnRelease"
+          $DownloadUrl    = "https://github.com/aliasmode/aliasmode-chromium/releases/download/v$OwnVersion-$OwnRelease/$ArchiveRoot.zip"
+
+          $RuntimeRoot = Join-Path $env:APPDATA "com.aliasmode.desktop\runtimes"
+          $TargetDir   = Join-Path $RuntimeRoot $RuntimeDirName
+          $ExePath     = Join-Path $TargetDir $ExecutableRel
+
+          New-Item -ItemType Directory -Path $RuntimeRoot -Force | Out-Null
+          $TempDir    = Join-Path "C:\Temp" ("am-chromium-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+          $ExtractDir = Join-Path $TempDir "extracted"
+          $ZipPath    = Join-Path $TempDir "$ArchiveRoot.zip"
+          New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
+
           try {
-              & $Sidecar install-browser
-              if ($LASTEXITCODE -ne 0) {
-                  Write-Warning "Sidecar install-browser returned exit code $LASTEXITCODE."
-                  exit $LASTEXITCODE
+              Write-Host "Downloading $ArchiveRoot.zip..."
+              & "$env:SystemRoot\System32\curl.exe" -fsSL --retry 3 -o $ZipPath $DownloadUrl
+              if ($LASTEXITCODE -ne 0) { throw "curl.exe failed with exit code $LASTEXITCODE" }
+
+              $ActualArchiveHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($ActualArchiveHash -ne $ArchiveSha256) {
+                  throw "Archive SHA-256 mismatch (expected $ArchiveSha256, got $ActualArchiveHash)"
               }
-              Write-Host "AliasMode Chromium engine pre-downloaded successfully."
+
+              Write-Host "Extracting runtime..."
+              & "$env:SystemRoot\System32\tar.exe" -xf $ZipPath -C $ExtractDir
+              if ($LASTEXITCODE -ne 0) { throw "tar.exe failed with exit code $LASTEXITCODE" }
+
+              $SourceRuntimeDir = Join-Path $ExtractDir $ArchiveRoot
+              if (-not (Test-Path $SourceRuntimeDir)) {
+                  throw "Expected extracted folder not found: $SourceRuntimeDir"
+              }
+
+              if (Test-Path $TargetDir) {
+                  Remove-Item -Path $TargetDir -Recurse -Force
+              }
+              Move-Item -Path $SourceRuntimeDir -Destination $TargetDir
+
+              $ActualExeHash = (Get-FileHash -Path $ExePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($ActualExeHash -ne $ExeSha256) {
+                  throw "Executable SHA-256 mismatch (expected $ExeSha256, got $ActualExeHash)"
+              }
+
+              & "$env:SystemRoot\System32\icacls.exe" $TargetDir /grant '*S-1-15-2-1:(OI)(CI)(RX)' '*S-1-15-2-2:(OI)(CI)(RX)' /T /Q
+              Write-Host "AliasMode Chromium $OwnVersion ($OwnRelease) verified and ready at $TargetDir"
           } finally {
-              Pop-Location
+              Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue
           }
 
       - name: Enable RDP
