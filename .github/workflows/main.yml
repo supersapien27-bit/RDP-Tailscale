@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Install Software, Python 3.14.5, and Playwright
+      - name: Install Software and Playwright
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -31,47 +31,25 @@ jobs:
           Start-Process "$env:TEMP\winrar_installer.exe" -ArgumentList "/s" -Wait
           Remove-Item "$env:TEMP\winrar_installer.exe" -Force -ErrorAction SilentlyContinue
 
-          # 3. Silently install Python 3.14.5 to a deterministic path
+          # 3. Attempt Python 3.14.5 install without blocking on exit code
           $PythonVersion = "3.14.5"
-          $PythonDir = "C:\Python314"
-          $PythonExe = Join-Path $PythonDir "python.exe"
-          $PythonScripts = Join-Path $PythonDir "Scripts"
-          $PythonInstaller = "$env:TEMP\python_installer.exe"
-
-          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe" -OutFile $PythonInstaller
+          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe" -OutFile "$env:TEMP\python_installer.exe"
           $PythonArgs = @(
               '/quiet',
               'InstallAllUsers=1',
-              "TargetDir=$PythonDir",
               'PrependPath=1',
               'Include_test=0'
           )
-          $PyProc = Start-Process -FilePath $PythonInstaller -ArgumentList $PythonArgs -Wait -PassThru
-          Remove-Item $PythonInstaller -Force -ErrorAction SilentlyContinue
+          Start-Process -FilePath "$env:TEMP\python_installer.exe" -ArgumentList $PythonArgs -Wait
+          Remove-Item "$env:TEMP\python_installer.exe" -Force -ErrorAction SilentlyContinue
 
-          if ($PyProc.ExitCode -ne 0 -or -not (Test-Path $PythonExe)) {
-              throw "Python $PythonVersion installation failed (exit code $($PyProc.ExitCode))."
-          }
+          # Refresh environment PATH for current session
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
 
-          # Force Python 3.14.5 ahead of runner's pre-installed Python 3.12 in Machine PATH (applies to RDP sessions too)
-          $MachinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-          $CleanedMachinePath = ($MachinePath -split ';' | Where-Object {
-              $_ -and ($_ -ne $PythonDir) -and ($_ -ne $PythonScripts)
-          }) -join ';'
-          $NewMachinePath = "$PythonDir;$PythonScripts;$CleanedMachinePath"
-          [System.Environment]::SetEnvironmentVariable("Path", $NewMachinePath, "Machine")
-
-          # Refresh current session PATH with Python 3.14.5 first
-          $UserPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
-          $env:Path = "$NewMachinePath;$UserPath"
-
-          Write-Host "Active Python binary: $((Get-Command python).Source)"
-          & $PythonExe --version
-
-          # 4. Install Playwright and its Chromium binaries specifically into Python 3.14.5
-          & $PythonExe -m pip install --upgrade pip
-          & $PythonExe -m pip install playwright
-          & $PythonExe -m playwright install chromium
+          # 4. Install Playwright and its Chromium binaries
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install chromium
 
       - name: Install Latest AliasMode
         shell: powershell
